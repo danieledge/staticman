@@ -1,18 +1,19 @@
 [build]
-command = "npm install"
-functions = "functions"
-publish = "."
+  command = "npm install && cd functions && npm install && cd .."
+  functions = "functions"
+  publish = "."
 
 [build.environment]
-NODE_VERSION = "16"
+  NODE_VERSION = "16"
 
 [[redirects]]
-from = "/v3/*"
-to = "/.netlify/functions/staticman/:splat"
-status = 200
+  from = "/v3/*"
+  to = "/.netlify/functions/staticman/:splat"
+  status = 200
+
 [[headers]]
-for = "/*"
-[headers.values]
-Access-Control-Allow-Origin = "*"
-Access-Control-Allow-Headers = "Content-Type, Authorization"
-Access-Control-Allow-Methods = "GET, POST, OPTIONS"
+  for = "/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Headers = "Content-Type, Authorization"
+    Access-Control-Allow-Methods = "GET, POST, OPTIONS"
