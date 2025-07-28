@@ -71,23 +71,36 @@ function parseMultipartFormData(buffer) {
 // Initialize GitHub client with App authentication
 async function getOctokit() {
     const appId = process.env.GITHUB_APP_ID;
-    const privateKey = process.env.GITHUB_PRIVATE_KEY_DECODED;
+    let privateKey = process.env.GITHUB_PRIVATE_KEY_DECODED;
     const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
 
     if (!appId || !privateKey || !installationId) {
         throw new Error('Missing GitHub App credentials');
     }
 
-    const octokit = new Octokit({
-        authStrategy: createAppAuth,
-        auth: {
-            appId: parseInt(appId),
-            privateKey: privateKey,
-            installationId: parseInt(installationId),
-        },
-    });
+    // Ensure private key has proper line endings
+    privateKey = privateKey.replace(/\\n/g, '\n');
 
-    return octokit;
+    // If the key doesn't start with the proper header, try to fix it
+    if (!privateKey.includes('-----BEGIN')) {
+        throw new Error('Invalid private key format - missing BEGIN header');
+    }
+
+    try {
+        const octokit = new Octokit({
+            authStrategy: createAppAuth,
+            auth: {
+                appId: parseInt(appId),
+                privateKey: privateKey,
+                installationId: parseInt(installationId),
+            },
+        });
+
+        return octokit;
+    } catch (error) {
+        console.error('Error creating Octokit instance:', error);
+        throw new Error(`GitHub authentication failed: ${error.message}`);
+    }
 }
 
 // Generate filename for submission
@@ -105,6 +118,33 @@ function hashEmail(email) {
 // Routes
 app.get('/v3/version', (req, res) => {
     res.json({ version: '3.0.0' });
+});
+
+// Debug endpoint to check configuration
+app.get('/v3/debug/config', (req, res) => {
+    const hasAppId = !!process.env.GITHUB_APP_ID;
+    const hasPrivateKey = !!process.env.GITHUB_PRIVATE_KEY_DECODED;
+    const hasInstallationId = !!process.env.GITHUB_APP_INSTALLATION_ID;
+
+    let privateKeyInfo = 'Not set';
+    if (hasPrivateKey) {
+        const key = process.env.GITHUB_PRIVATE_KEY_DECODED;
+        privateKeyInfo = {
+            length: key.length,
+            hasBeginHeader: key.includes('-----BEGIN'),
+            hasEndFooter: key.includes('-----END'),
+            firstChars: key.substring(0, 30) + '...',
+            lastChars: '...' + key.substring(key.length - 30)
+        };
+    }
+
+    res.json({
+        config: {
+            GITHUB_APP_ID: hasAppId ? 'Set' : 'Missing',
+            GITHUB_PRIVATE_KEY_DECODED: hasPrivateKey ? privateKeyInfo : 'Missing',
+            GITHUB_APP_INSTALLATION_ID: hasInstallationId ? 'Set' : 'Missing',
+        }
+    });
 });
 
 app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) => {
