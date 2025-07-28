@@ -1,11 +1,14 @@
 const express = require('express');
 const serverless = require('serverless-http');
-const fs = require('fs');
-const path = require('path');
+const { App } = require('@octokit/app');
+const { Octokit } = require('@octokit/rest');
+const yaml = require('js-yaml');
+const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const app = express();
 
-// Middleware - parse form data properly
+// Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.raw({ type: 'multipart/form-data', limit: '10mb' }));
@@ -39,10 +42,9 @@ function parseMultipartFormData(buffer) {
                 const match = lines[i].match(/name="([^"]+)"/);
                 if (match) {
                     fieldName = match[1];
-                    // The value is typically on the next non-empty line after an empty line
-                    if (lines[i + 1] === '' && lines[i + 2]) {
-                        value = lines[i + 2];
-                    } else if (lines[i + 1]) {
+                    if (i + 1 < lines.length && lines[i + 1] === '') {
+                        value = lines[i + 2] || '';
+                    } else if (i + 1 < lines.length) {
                         value = lines[i + 1];
                     }
                     break;
@@ -50,8 +52,7 @@ function parseMultipartFormData(buffer) {
             }
         }
 
-        if (fieldName && value) {
-            // Handle nested field names like fields[title]
+        if (fieldName) {
             if (fieldName.includes('[') && fieldName.includes(']')) {
                 const match = fieldName.match(/([^\[]+)\[([^\]]+)\]/);
                 if (match) {
@@ -68,6 +69,37 @@ function parseMultipartFormData(buffer) {
     return formData;
 }
 
+// Initialize GitHub App
+function getOctokit() {
+    const appId = process.env.GITHUB_APP_ID;
+    const privateKey = process.env.GITHUB_PRIVATE_KEY_DECODED ||
+        Buffer.from(process.env.GITHUB_PRIVATE_KEY || '', 'base64').toString('utf-8');
+    const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
+
+    if (!appId || !privateKey || !installationId) {
+        throw new Error('Missing GitHub App credentials');
+    }
+
+    const appInstance = new App({
+        appId: parseInt(appId),
+        privateKey: privateKey,
+    });
+
+    return appInstance.getInstallationOctokit(parseInt(installationId));
+}
+
+// Generate filename for submission
+function generateFilename(type) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const id = uuidv4().substring(0, 8);
+    return `${type}-${timestamp}-${id}.json`;
+}
+
+// Hash email for privacy
+function hashEmail(email) {
+    return crypto.createHash('md5').update(email.toLowerCase().trim()).digest('hex');
+}
+
 // Routes
 app.get('/v3/version', (req, res) => {
     res.json({ version: '3.0.0' });
@@ -77,35 +109,129 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
     try {
         let formData = {};
 
-        // Parse the form data based on content type
+        // Parse the form data
         if (req.headers['content-type'] && req.headers['content-type'].includes('multipart/form-data')) {
             formData = parseMultipartFormData(req.body);
         } else {
             formData = req.body;
         }
 
-        // Extract the actual fields from the form data
         const fields = formData.fields || {};
         const options = formData.options || {};
+        const { username, repository, branch, property } = req.params;
 
-        console.log('Received submission:', {
-            params: req.params,
-            fields: fields,
-            options: options
+        // Validate required fields based on property type
+        const requiredFields = property === 'timelineAmendments'
+            ? ['name', 'email', 'originalEntryDate', 'amendments']
+            : ['name', 'email', 'date', 'title', 'description'];
+
+        const missingFields = requiredFields.filter(field => !fields[field]);
+        if (missingFields.length > 0) {
+            return res.status(400).json({
+                error: 'MISSING_REQUIRED_FIELDS',
+                message: `Missing required fields: ${missingFields.join(', ')}`
+            });
+        }
+
+        // Prepare submission data
+        const submissionData = {
+            _id: hashEmail(fields.email),
+            ...fields,
+            email: hashEmail(fields.email), // Hash email for privacy
+            date: new Date().toISOString()
+        };
+
+        // Initialize GitHub client
+        const octokit = await getOctokit();
+
+        // Determine file path
+        const filePath = property === 'timelineAmendments'
+            ? `_data/timeline/amendments/${generateFilename('amendment')}`
+            : `_data/timeline/entries/${generateFilename('entry')}`;
+
+        // Create file content
+        const fileContent = JSON.stringify(submissionData, null, 2);
+        const contentBase64 = Buffer.from(fileContent).toString('base64');
+
+        // Create branch name for PR
+        const prBranch = `staticman_${property}_${Date.now()}`;
+
+        // Get the base branch reference
+        const { data: ref } = await octokit.git.getRef({
+            owner: username,
+            repo: repository,
+            ref: `heads/${branch}`
         });
 
-        // For now, return success with parsed data
-        res.json({
-            success: true,
-            message: 'Staticman endpoint reached - data parsed successfully',
-            params: req.params,
-            fields: fields,
-            options: options,
-            timestamp: new Date().toISOString()
+        // Create new branch
+        await octokit.git.createRef({
+            owner: username,
+            repo: repository,
+            ref: `refs/heads/${prBranch}`,
+            sha: ref.object.sha
         });
+
+        // Create file in new branch
+        await octokit.repos.createOrUpdateFileContents({
+            owner: username,
+            repo: repository,
+            path: filePath,
+            message: `Add Staticman entry`,
+            content: contentBase64,
+            branch: prBranch
+        });
+
+        // Create pull request
+        const prTitle = property === 'timelineAmendments'
+            ? `Amendment for entry: ${fields.originalEntryDate}`
+            : `New timeline entry: ${fields.title}`;
+
+        const prBody = `### Staticman Submission
+        
+**Type**: ${property === 'timelineAmendments' ? 'Amendment' : 'New Entry'}
+**Submitted by**: ${fields.name}
+**Date**: ${new Date().toISOString()}
+
+#### Content
+${property === 'timelineAmendments' 
+    ? `**Original Entry Date**: ${fields.originalEntryDate}\n**Amendments**: ${fields.amendments}`
+    : `**Date**: ${fields.date}\n**Title**: ${fields.title}\n**Description**: ${fields.description}`}
+
+${fields.citations ? `**Citations**: ${fields.citations}` : ''}
+${fields.imageSuggestions ? `**Image Suggestions**: ${fields.imageSuggestions}` : ''}
+
+---
+*This pull request was automatically generated by Staticman.*`;
+
+        const { data: pr } = await octokit.pulls.create({
+            owner: username,
+            repo: repository,
+            title: prTitle,
+            body: prBody,
+            head: prBranch,
+            base: branch
+        });
+
+        // Return success with redirect if specified
+        if (options.redirect) {
+            res.redirect(options.redirect);
+        } else {
+            res.json({
+                success: true,
+                message: 'Submission created successfully',
+                pull_request: {
+                    url: pr.html_url,
+                    number: pr.number
+                }
+            });
+        }
+
     } catch (error) {
         console.error('Error processing submission:', error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({
+            error: error.message,
+            details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
     }
 });
 
