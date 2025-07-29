@@ -4,6 +4,7 @@ const { createAppAuth } = require('@octokit/auth-app');
 const { Octokit } = require('@octokit/rest');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
+const yaml = require('js-yaml');
 
 const app = express();
 
@@ -103,6 +104,45 @@ async function getOctokit() {
     }
 }
 
+// Function to fetch staticman.yml configuration
+async function getStaticmanConfig(octokit, owner, repo, branch) {
+    try {
+        const { data } = await octokit.rest.repos.getContent({
+            owner,
+            repo,
+            path: 'staticman.yml',
+            ref: branch
+        });
+
+        const content = Buffer.from(data.content, 'base64').toString('utf-8');
+        return yaml.load(content);
+    } catch (error) {
+        console.error('Error fetching staticman.yml:', error);
+        return null;
+    }
+}
+
+// Function to process template strings
+function processTemplate(template, data) {
+    if (!template) return '';
+
+    // Replace {{fields.name}} style placeholders
+    let processed = template.replace(/\{\{fields\.(\w+)\}\}/g, (match, fieldName) => {
+        return data.fields && data.fields[fieldName] ? data.fields[fieldName] : '';
+    });
+
+    // Replace {{date}} with current date
+    processed = processed.replace(/\{\{date\}\}/g, new Date().toISOString());
+
+    // Replace {{options.slug}} with the property name
+    processed = processed.replace(/\{\{options\.slug\}\}/g, data.property || '');
+
+    // Convert \n to actual newlines
+    processed = processed.replace(/\\n/g, '\n');
+
+    return processed;
+}
+
 // Generate filename for submission
 function generateFilename(type) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -162,10 +202,20 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
         const options = formData.options || {};
         const { username, repository, branch, property } = req.params;
 
-        // Validate required fields based on property type
-        const requiredFields = property === 'timelineAmendments'
-            ? ['name', 'email', 'originalEntryDate', 'amendments']
-            : ['name', 'email', 'date', 'title', 'description'];
+        // Initialize GitHub client
+        const octokit = await getOctokit();
+
+        // Fetch staticman configuration
+        const config = await getStaticmanConfig(octokit, username, repository, branch);
+
+        // Get the configuration for this specific property/endpoint
+        const endpointConfig = config && config[property] ? config[property] : {};
+
+        // Use required fields from config or fallback to defaults
+        const requiredFields = endpointConfig.requiredFields ||
+            (property === 'timelineAmendments'
+                ? ['name', 'email', 'originalEntryDate', 'amendments']
+                : ['name', 'email', 'date', 'title', 'description']);
 
         const missingFields = requiredFields.filter(field => !fields[field]);
         if (missingFields.length > 0) {
@@ -175,21 +225,43 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
             });
         }
 
+        // Check allowed fields if configured
+        if (endpointConfig.allowedFields) {
+            const allowedFields = endpointConfig.allowedFields;
+            const submittedFields = Object.keys(fields);
+            const invalidFields = submittedFields.filter(field => !allowedFields.includes(field));
+
+            if (invalidFields.length > 0) {
+                console.warn(`Ignoring non-allowed fields: ${invalidFields.join(', ')}`);
+                // Remove non-allowed fields
+                invalidFields.forEach(field => delete fields[field]);
+            }
+        }
+
+        // Apply transforms if configured
+        const transforms = endpointConfig.transforms || {};
+        if (transforms.email === 'md5' && fields.email) {
+            fields.email = hashEmail(fields.email);
+        }
+
         // Prepare submission data
         const submissionData = {
             _id: hashEmail(fields.email),
             ...fields,
-            email: hashEmail(fields.email), // Hash email for privacy
             date: new Date().toISOString()
         };
 
-        // Initialize GitHub client
-        const octokit = await getOctokit();
+        // Determine file path from config or use defaults
+        const basePath = endpointConfig.path ||
+            (property === 'timelineAmendments'
+                ? '_data/timeline/amendments'
+                : '_data/timeline/entries');
 
-        // Determine file path
-        const filePath = property === 'timelineAmendments'
-            ? `_data/timeline/amendments/${generateFilename('amendment')}`
-            : `_data/timeline/entries/${generateFilename('entry')}`;
+        const filename = endpointConfig.filename ?
+            endpointConfig.filename.replace('{@timestamp}', new Date().toISOString().replace(/[:.]/g, '-')) :
+            generateFilename(property === 'timelineAmendments' ? 'amendment' : 'entry');
+
+        const filePath = `${basePath}/${filename}.json`;
 
         // Create file content
         const fileContent = JSON.stringify(submissionData, null, 2);
@@ -223,27 +295,39 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
             branch: prBranch
         });
 
-        // Create pull request
+        // Create pull request with configuration template
         const prTitle = property === 'timelineAmendments'
             ? `Amendment for entry: ${fields.originalEntryDate}`
             : `New timeline entry: ${fields.title}`;
 
-        const prBody = `### Staticman Submission
-        
+        // Use the pullRequestBody from config, or fall back to default
+        let prBody;
+        if (endpointConfig.pullRequestBody) {
+            prBody = processTemplate(endpointConfig.pullRequestBody, {
+                fields,
+                property,
+                options
+            });
+        } else {
+            // Comprehensive fallback template that includes all possible fields
+            const allFields = Object.keys(fields).filter(key => key !== 'email');
+            let fieldsList = allFields.map(field => {
+                const fieldName = field.charAt(0).toUpperCase() + field.slice(1).replace(/([A-Z])/g, ' $1');
+                return `**${fieldName}**: ${fields[field]}`;
+            }).join('\n');
+
+            prBody = `### Staticman Submission
+
 **Type**: ${property === 'timelineAmendments' ? 'Amendment' : 'New Entry'}
 **Submitted by**: ${fields.name}
 **Date**: ${new Date().toISOString()}
 
 #### Content
-${property === 'timelineAmendments' 
-    ? `**Original Entry Date**: ${fields.originalEntryDate}\n**Amendments**: ${fields.amendments}`
-    : `**Date**: ${fields.date}\n**Title**: ${fields.title}\n**Description**: ${fields.description}`}
-
-${fields.citations ? `**Citations**: ${fields.citations}` : ''}
-${fields.imageSuggestions ? `**Image Suggestions**: ${fields.imageSuggestions}` : ''}
+${fieldsList}
 
 ---
 *This pull request was automatically generated by Staticman.*`;
+        }
 
         const { data: pr } = await octokit.rest.pulls.create({
             owner: username,
