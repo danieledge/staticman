@@ -113,7 +113,7 @@ async function getStaticmanConfig(octokit, owner, repo, branch) {
             path: 'staticman.yml',
             ref: branch
         });
-
+        
         const content = Buffer.from(data.content, 'base64').toString('utf-8');
         return yaml.load(content);
     } catch (error) {
@@ -125,21 +125,21 @@ async function getStaticmanConfig(octokit, owner, repo, branch) {
 // Function to process template strings
 function processTemplate(template, data) {
     if (!template) return '';
-
+    
     // Replace {{fields.name}} style placeholders
     let processed = template.replace(/\{\{fields\.(\w+)\}\}/g, (match, fieldName) => {
         return data.fields && data.fields[fieldName] ? data.fields[fieldName] : '';
     });
-
+    
     // Replace {{date}} with current date
     processed = processed.replace(/\{\{date\}\}/g, new Date().toISOString());
-
+    
     // Replace {{options.slug}} with the property name
     processed = processed.replace(/\{\{options\.slug\}\}/g, data.property || '');
-
+    
     // Convert \n to actual newlines
     processed = processed.replace(/\\n/g, '\n');
-
+    
     return processed;
 }
 
@@ -204,15 +204,15 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
 
         // Initialize GitHub client
         const octokit = await getOctokit();
-
+        
         // Fetch staticman configuration
         const config = await getStaticmanConfig(octokit, username, repository, branch);
-
+        
         // Get the configuration for this specific property/endpoint
         const endpointConfig = config && config[property] ? config[property] : {};
-
+        
         // Use required fields from config or fallback to defaults
-        const requiredFields = endpointConfig.requiredFields ||
+        const requiredFields = endpointConfig.requiredFields || 
             (property === 'timelineAmendments'
                 ? ['name', 'email', 'originalEntryDate', 'amendments']
                 : ['name', 'email', 'date', 'title', 'description']);
@@ -230,7 +230,7 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
             const allowedFields = endpointConfig.allowedFields;
             const submittedFields = Object.keys(fields);
             const invalidFields = submittedFields.filter(field => !allowedFields.includes(field));
-
+            
             if (invalidFields.length > 0) {
                 console.warn(`Ignoring non-allowed fields: ${invalidFields.join(', ')}`);
                 // Remove non-allowed fields
@@ -252,15 +252,15 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
         };
 
         // Determine file path from config or use defaults
-        const basePath = endpointConfig.path ||
-            (property === 'timelineAmendments'
-                ? '_data/timeline/amendments'
+        const basePath = endpointConfig.path || 
+            (property === 'timelineAmendments' 
+                ? '_data/timeline/amendments' 
                 : '_data/timeline/entries');
-
-        const filename = endpointConfig.filename ?
+        
+        const filename = endpointConfig.filename ? 
             endpointConfig.filename.replace('{@timestamp}', new Date().toISOString().replace(/[:.]/g, '-')) :
             generateFilename(property === 'timelineAmendments' ? 'amendment' : 'entry');
-
+            
         const filePath = `${basePath}/${filename}.json`;
 
         // Create file content
@@ -295,28 +295,103 @@ app.post('/v3/entry/:username/:repository/:branch/:property', async (req, res) =
             branch: prBranch
         });
 
-        // Create pull request with configuration template
-        const prTitle = property === 'timelineAmendments'
+        // Check if we should create an issue instead of a PR
+        const useGithubIssue = endpointConfig.githubIssue && endpointConfig.githubIssue.enabled;
+        
+        // Create title
+        const title = property === 'timelineAmendments'
             ? `Amendment for entry: ${fields.originalEntryDate}`
             : `New timeline entry: ${fields.title}`;
 
-        // Use the pullRequestBody from config, or fall back to default
-        let prBody;
-        if (endpointConfig.pullRequestBody) {
-            prBody = processTemplate(endpointConfig.pullRequestBody, {
-                fields,
-                property,
-                options
-            });
-        } else {
-            // Comprehensive fallback template that includes all possible fields
-            const allFields = Object.keys(fields).filter(key => key !== 'email');
-            let fieldsList = allFields.map(field => {
-                const fieldName = field.charAt(0).toUpperCase() + field.slice(1).replace(/([A-Z])/g, ' $1');
-                return `**${fieldName}**: ${fields[field]}`;
-            }).join('\n');
+        let responseData;
+        
+        if (useGithubIssue) {
+            // Create GitHub Issue instead of PR
+            
+            // Use issueBody template if available, otherwise use pullRequestBody or default
+            let issueBody;
+            if (endpointConfig.githubIssue.body) {
+                issueBody = processTemplate(endpointConfig.githubIssue.body, {
+                    fields,
+                    property,
+                    options
+                });
+            } else if (endpointConfig.pullRequestBody) {
+                issueBody = processTemplate(endpointConfig.pullRequestBody, {
+                    fields,
+                    property,
+                    options
+                });
+            } else {
+                // Comprehensive fallback template that includes all possible fields
+                const allFields = Object.keys(fields).filter(key => key !== 'email');
+                let fieldsList = allFields.map(field => {
+                    const fieldName = field.charAt(0).toUpperCase() + field.slice(1).replace(/([A-Z])/g, ' $1');
+                    return `**${fieldName}**: ${fields[field]}`;
+                }).join('\n');
+                
+                issueBody = `### Staticman Submission
 
-            prBody = `### Staticman Submission
+**Type**: ${property === 'timelineAmendments' ? 'Amendment' : 'New Entry'}
+**Submitted by**: ${fields.name}
+**Date**: ${new Date().toISOString()}
+
+#### Content
+${fieldsList}
+
+---
+*This issue was automatically generated by Staticman.*`;
+            }
+            
+            // Create the issue
+            const issueData = {
+                owner: username,
+                repo: repository,
+                title: title,
+                body: issueBody
+            };
+            
+            // Add labels if configured
+            if (endpointConfig.githubIssue.labels) {
+                issueData.labels = endpointConfig.githubIssue.labels;
+            }
+            
+            // Add assignees if configured
+            if (endpointConfig.githubIssue.assignees) {
+                issueData.assignees = endpointConfig.githubIssue.assignees;
+            }
+            
+            const { data: issue } = await octokit.rest.issues.create(issueData);
+            
+            responseData = {
+                success: true,
+                message: 'Issue created successfully',
+                issue: {
+                    url: issue.html_url,
+                    number: issue.number
+                }
+            };
+            
+        } else {
+            // Create Pull Request (original behavior)
+            
+            // Use the pullRequestBody from config, or fall back to default
+            let prBody;
+            if (endpointConfig.pullRequestBody) {
+                prBody = processTemplate(endpointConfig.pullRequestBody, {
+                    fields,
+                    property,
+                    options
+                });
+            } else {
+                // Comprehensive fallback template that includes all possible fields
+                const allFields = Object.keys(fields).filter(key => key !== 'email');
+                let fieldsList = allFields.map(field => {
+                    const fieldName = field.charAt(0).toUpperCase() + field.slice(1).replace(/([A-Z])/g, ' $1');
+                    return `**${fieldName}**: ${fields[field]}`;
+                }).join('\n');
+                
+                prBody = `### Staticman Submission
 
 **Type**: ${property === 'timelineAmendments' ? 'Amendment' : 'New Entry'}
 **Submitted by**: ${fields.name}
@@ -327,29 +402,32 @@ ${fieldsList}
 
 ---
 *This pull request was automatically generated by Staticman.*`;
-        }
+            }
 
-        const { data: pr } = await octokit.rest.pulls.create({
-            owner: username,
-            repo: repository,
-            title: prTitle,
-            body: prBody,
-            head: prBranch,
-            base: branch
-        });
+            const { data: pr } = await octokit.rest.pulls.create({
+                owner: username,
+                repo: repository,
+                title: title,
+                body: prBody,
+                head: prBranch,
+                base: branch
+            });
+            
+            responseData = {
+                success: true,
+                message: 'Pull request created successfully',
+                pull_request: {
+                    url: pr.html_url,
+                    number: pr.number
+                }
+            };
+        }
 
         // Return success with redirect if specified
         if (options.redirect) {
             res.redirect(options.redirect);
         } else {
-            res.json({
-                success: true,
-                message: 'Submission created successfully',
-                pull_request: {
-                    url: pr.html_url,
-                    number: pr.number
-                }
-            });
+            res.json(responseData);
         }
 
     } catch (error) {
